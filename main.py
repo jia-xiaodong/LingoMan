@@ -37,9 +37,6 @@ def read_string_from_game_data():
     strings = set()
     data_root = os.path.join(game_root, r'config\GameDatasNew')
     regex = re.compile(r'(LC_\w+)')
-    # TODO: client
-    # TODO: server
-    # TODO: shared
     folders = ['Client', 'Server', 'Share']
     for each_dir in folders:
         folder = os.path.join(data_root, each_dir)
