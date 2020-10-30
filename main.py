@@ -196,6 +196,8 @@ class MainApp(tk.Tk):
         btn.pack(side=tk.LEFT, padx=5, pady=5)
         btn = tk.Button(self, text='Find Suspicious Text', command=self.on_button_find_error)
         btn.pack(side=tk.TOP, padx=5, pady=5)
+        btn = tk.Button(self, text='Test', command=self.dump_result)
+        btn.pack(side=tk.TOP, padx=5, pady=5)
         #
         self.title(MainApp.TITLE)
 
@@ -253,10 +255,13 @@ class MainApp(tk.Tk):
         workbook = os.path.join(game_root, r'Assets\Text\LOC.xlsx')
         frame_dict = pd.read_excel(workbook, sheet_name=None)
         for sheet, frame in frame_dict.items():
-            for cell in frame['ID']:  # 暂时只考虑ID这一列。在精简了文本以后，可以全读出来做深入分析
-                text_id = '{0}_{1}'.format(sheet, cell)
-                self._all_strings.add(text_id.strip())
             self._xlsx_sheets.append(sheet)
+            try:
+                for cell in frame['ID']:  # 暂时只考虑ID这一列。在精简了文本以后，可以全读出来做深入分析
+                    text_id = '{0}_{1}'.format(sheet, cell)
+                    self._all_strings.add(text_id.strip())
+            except Exception as e:
+                print(e)
 
     def on_button_find_error(self):
         if self._used_strings is None:
@@ -270,30 +275,45 @@ class MainApp(tk.Tk):
         # 2. 第二次，组合式的文本
         possible_defined_total = set()
         possible_used_total = set()
+        regex_csharp = re.compile(r'(\w+)({.+})(\w*)')  # 搜索C#的Interpolated String，形如：$"LC_COMMON_{agentName}"
         print('--- possible used:')
         for each in undefined:
             possible_used = set()
+            if regex_csharp.match(each):
+                pattern = regex_csharp.sub(r'\1([a-zA-Z0-9_]+)\3', each)  # 实时创建出正则匹配器
+                regex = re.compile(pattern)
+            else:
+                regex = None
             for full in self._all_strings:
                 if full.find(each) > -1:
                     possible_used.add(full)
+                elif regex is not None and regex.match(full):
+                    possible_used.add(full)
             if len(possible_used) > 0:
-                possible_defined_total.add(each)  # 汇总
-                print(each)
-                for i in possible_used:
+                possible_defined_total.add(each)  # 汇总：
+                print(each)                       # 1. 可以认为该项是“已经定义”（在多语言文本里）
+                for i in possible_used:           # 2. 所有相关的匹配项都认为是“被使用”状态
                     print('\t' + i)
                 possible_used_total |= possible_used  # 汇总
         undefined = undefined - possible_defined_total
         unused = unused - possible_used_total
         # 3. 第三次，大小写拼写错误
-        print('\n\n--- possible spelling mistake:')
+        print('--- possible spelling mistake:')
         all_strings_pairs = [(i.lower(), i) for i in self._all_strings]
         possible_defined_total.clear()
         possible_used_total.clear()
         for each in undefined:
             each_lowercase = each.lower()
             possible_used = set()
+            if regex_csharp.match(each):
+                pattern = regex_csharp.sub(r'\1([a-zA-Z0-9_]+)\3', each_lowercase)  # 实时创建出正则匹配器
+                regex = re.compile(pattern)
+            else:
+                regex = None
             for full_lowercase, full in all_strings_pairs:
                 if full_lowercase.find(each_lowercase) > -1:
+                    possible_used.add(full)
+                elif regex is not None and regex.match(full_lowercase):
                     possible_used.add(full)
             if len(possible_used) > 0:
                 possible_defined_total.add(each)  # 汇总
@@ -306,19 +326,22 @@ class MainApp(tk.Tk):
                 possible_used_total |= possible_used  # 汇总
         undefined = undefined - possible_defined_total
         unused = unused - possible_used_total
-        #
-        print('\n\n--- undefined text IDs:')
-        for each in undefined:
-            print(each)
-            locations = self._used_strings.locations(each)
-            for location in locations:
-                print('\t' + location)
-
+        # 1/2. 输出最后结果：未找到定义
+        if len(undefined) > 0:
+            print('--- undefined text IDs:')
+            for each in undefined:
+                print(each)
+                locations = self._used_strings.locations(each)
+                for location in locations:
+                    print('\t' + location)
+        # 2/2. 输出最后结果：未找到引用
         if len(unused) > 0:
-            print('\n\n--- unused text IDs:')
+            print('--- unused text IDs:')
             for each in unused:
                 print(each)
             self._database.update_unused(unused)
+        # 输出结果到Excel表里
+        self.dump_result(unused)
         #
         messagebox.showinfo(MainApp.TITLE, '[Check Error] Job is done.')
 
@@ -446,8 +469,9 @@ class MainApp(tk.Tk):
             print('Error on collecting symbols: %s' % proc.stderr)
             return set()
         strings = set()
-        regex = re.compile(r'TEXT:\s+(\w+),(.+)')
-        for line in proc.stdout.split('\n'):
+        regex = re.compile(r'TEXT:\s+(.+),(.+)')
+        outputs = proc.stdout.split('\n')
+        for line in outputs:
             result = regex.match(line)
             if result is None:
                 continue
@@ -455,13 +479,43 @@ class MainApp(tk.Tk):
             strings.add((tid, location))
         return strings
 
-    def dump_result(self):
-        """
-
-        :return:
-        """
-        # TODO: dump result to XLSX files
-        pass
+    def dump_result(self, unused):
+        # 为加快速度，把文本ID拆分成多个集合
+        unused_dict = {}
+        prefixes = [i + '_' for i in self._xlsx_sheets]
+        for i in self._xlsx_sheets:
+            unused_dict[i] = set()
+        for each_text in unused:
+            for prefix in prefixes:
+                if each_text.startswith(prefix):
+                    tid = each_text[len(prefix):]
+                    section = prefix[:-1]
+                    unused_dict[section].add(tid)
+                    break
+        # 最后结果输出到这两个文件里
+        writer_used = pd.ExcelWriter("used.xlsx")
+        writer_unused = pd.ExcelWriter("unused.xlsx")
+        # 遍历源Excel
+        workbook = os.path.join(game_root, r'Assets\Text\LOC.xlsx')
+        frame_dict = pd.read_excel(workbook, sheet_name=None)
+        for sheet, frame in frame_dict.items():
+            try:
+                frame_used = pd.DataFrame(columns=frame.columns)
+                frame_unused = pd.DataFrame(columns=frame.columns)
+                for index, row in frame.iterrows():
+                    if row['ID'] in unused_dict[sheet]:
+                        frame_unused.loc[index] = row
+                    else:
+                        frame_used.loc[index] = row
+                frame_used.to_excel(writer_used, sheet_name=sheet, index=False)
+                writer_used.save()
+                frame_unused.to_excel(writer_unused, sheet_name=sheet, index=False)
+                writer_unused.save()
+            except Exception as e:
+                print(e)
+        # 保存到文件
+        writer_used.close()
+        writer_unused.close()
 
     @staticmethod
     def create_stats(used_strings):
@@ -471,5 +525,34 @@ class MainApp(tk.Tk):
         return stats
 
 
+def test():
+    target = r"TEXT: LC_COMMON_TransServer_StateName_{state + 1},Assets\Scripts\TransServer\UMenuServerDetails.cs"
+    regex = re.compile(r'TEXT:\s+(.+),(.+)')
+    result = regex.match(target)
+    if not result is None:
+        print(result.group(1) + '  ' + result.group(2))
+
+
+def test2():
+    a = set([1, 2, 3, 4, 5])
+    for i in a:
+        if i % 2 == 0:
+            a.remove(i)
+    for i in a:
+        print(i)
+
+
+def test3():
+    df = pd.DataFrame({'species': ['bear', 'bear', 'marsupial'],
+                       'population': [1864, 22000, 80000]},
+                      index=[2, 3, 4])
+    df.append()
+    writer = pd.ExcelWriter("tmp.xlsx")
+    df.to_excel(writer, sheet_name='Jia')
+    writer.save()
+    writer.close()
+
+
 if __name__ == "__main__":
     MainApp().mainloop()
+    #test()
