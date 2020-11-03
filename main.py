@@ -8,11 +8,75 @@ import re
 import sqlite3
 import tkinter as tk
 import tkinter.messagebox as messagebox
+import tkinter.filedialog as filedialog
 import subprocess
+import json
 
 game_root = r"D:\Projects\B2\UnityExperiment"
 database_path = r'D:\tools\LingoMan\text_stats.sqlite3'
 roslyn_finder = r'D:\demos\MySlnFindRef\FindTextRef\bin\Release\net472\FindTextRef.exe'
+
+
+def str_split(separators, target):
+    for c in separators:
+        if c in target:
+            return target.split(c)
+    else:
+        return [target]
+
+
+def try_read_text_file(filename):
+    ifs = open(filename, 'rb')
+    raw = ifs.read()
+    ifs.close()
+
+    content = None
+    utf_boms = {
+        'utf-8-sig': [codecs.BOM_UTF8],
+        'utf-32': [codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE],
+        'utf-16': [codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE]
+    }
+    # 1. try BOM
+    for enc, boms in utf_boms.items():
+        if any(raw.startswith(bom) for bom in boms):
+            content = raw.decode(encoding=enc)
+            break
+    else:
+        # 2. without BOM
+        for enc in ['utf-8', 'utf-16', 'utf-32', 'gb2312', 'big5', 'big5hkscs', 'gbk', 'gb18030', 'ansi']:
+            try:
+                content = raw.decode(encoding=enc)
+                break
+            except UnicodeDecodeError as e:
+                pass
+    return content
+
+
+class StringSplit:
+    """
+    中间的间隔符可以有多个。str的内置split只支持一个间隔符。
+    Coding Example:
+        target = "abc;| def;     ghi |;"
+        splitor = StringSplit('|;, ')
+        strings = splitor.split(target)
+    Output:
+        abc
+        def
+        ghi
+    """
+    def __init__(self, separators):
+        pattern = '([^%s]+)[%s]*?(.*)' % (separators, separators)
+        self._regex = re.compile(pattern)
+
+    def split(self, target):
+        strings = []
+        while len(target) > 0:
+            result = self._regex.search(target)
+            if result is None:
+                return strings
+            strings.append(result.group(1))
+            target = result.group(2)
+        return strings
 
 
 class TextStats:
@@ -104,6 +168,30 @@ class TextDataBase:
         except Exception as e:
             print('Error on insertion of unused texts: %s' % e)
 
+    def append_unused(self, text_ids):
+        """
+        :param text_ids: sequence of text_id
+        """
+        try:
+            cur = self._con.cursor()
+            sql = 'INSERT INTO unused (tid) VALUES(?)'
+            args = [(i,) for i in text_ids]
+            cur.executemany(sql, args)
+            self._con.commit()
+        except Exception as e:
+            print('Error on insertion of unused texts: %s' % e)
+
+    def is_used(self, text_id):
+        records = []
+        try:
+            cur = self._con.cursor()
+            cur.execute('SELECT * FROM used WHERE tid=?', (text_id,))
+            records = cur.fetchall()
+        except Exception as e:
+            print('Error on insertion of unused texts: %s' % e)
+        finally:
+            return len(records) > 0
+
     def close(self):
         self._con.close()
         self._filename = None
@@ -188,15 +276,57 @@ class MainApp(tk.Tk):
 
     def __init__(self, *a, **kw):
         tk.Tk.__init__(self, *a, **kw)
-        frame = tk.LabelFrame(self, text='Database', padx=5, pady=5)
-        frame.pack(side=tk.TOP, padx=5, pady=5)
-        btn = tk.Button(frame, text='Create New Database (Slow)', command=self.on_button_create_new)
-        btn.pack(side=tk.LEFT, padx=5, pady=5)
-        btn = tk.Button(frame, text='Open Old Database (Fast)', command=self.on_button_open_old)
-        btn.pack(side=tk.LEFT, padx=5, pady=5)
-        btn = tk.Button(self, text='Find Suspicious Text', command=self.on_button_find_error)
+        frame = tk.LabelFrame(self, text='（Step 1/3）记录多语言文本的使用情况（used）', padx=5, pady=5)
+        frame.pack(side=tk.TOP, padx=5, pady=5, fill=tk.BOTH, expand=tk.YES)
+
+        frame1 = tk.LabelFrame(frame, text='创建新的数据库（慢）', padx=5, pady=5)
+        frame1.pack(side=tk.TOP, padx=5, pady=5, fill=tk.BOTH, expand=tk.YES)
+
+        sub_frame = tk.Frame(frame1)
+        sub_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=tk.YES)
+
+        label = tk.Label(sub_frame, text='活动模板的列表：')
+        label.pack(side=tk.LEFT, fill=tk.X, expand=tk.NO)
+
+        self._activity_list = tk.StringVar()
+        entry = tk.Entry(sub_frame, textvariable=self._activity_list)
+        entry.pack(side=tk.LEFT, padx=5, pady=5, fill=tk.X, expand=tk.YES)
+
+        btn = tk.Button(sub_frame, text='浏览', command=self.on_btn_find_activity_list)
+        btn.pack(side=tk.LEFT, padx=5, pady=5, fill=tk.X, expand=tk.NO)
+
+        btn = tk.Button(frame1, text='开始扫描：活动模板、代码、Prefab、数据表', command=self.on_button_create_new)
         btn.pack(side=tk.TOP, padx=5, pady=5)
-        btn = tk.Button(self, text='Test', command=self.dump_result)
+
+        btn = tk.Button(frame, text='打开旧的数据库（快）', command=self.on_button_open_old)
+        btn.pack(side=tk.TOP, padx=5, pady=5)
+
+        frame = tk.LabelFrame(self, text='（Step 2/3）统计无用的多语言文本（unused）', padx=5, pady=5)
+        frame.pack(side=tk.TOP, padx=5, pady=5, fill=tk.BOTH, expand=tk.YES)
+
+        btn = tk.Button(frame, text='第一步：自动分析', command=self.on_btn_find_error)
+        btn.pack(side=tk.TOP, padx=5, pady=5)
+
+        sub_frame = tk.Frame(frame)
+        sub_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=tk.YES)
+
+        label = tk.Label(sub_frame, text='第二步：人工补充（可选）')
+        label.pack(side=tk.LEFT, fill=tk.X, expand=tk.NO)
+
+        self._manual_analysis = tk.StringVar()
+        entry = tk.Entry(sub_frame, textvariable=self._manual_analysis)
+        entry.pack(side=tk.LEFT, padx=5, pady=5, fill=tk.X, expand=tk.YES)
+
+        btn = tk.Button(sub_frame, text='浏览', command=self.on_btn_browse_manual_file)
+        btn.pack(side=tk.LEFT, padx=5, pady=5)
+
+        btn = tk.Button(sub_frame, text='添加到数据库', command=self.on_btn_update_unused_manually)
+        btn.pack(side=tk.LEFT, padx=5, pady=5)
+
+        frame = tk.LabelFrame(self, text='（Step 3/3）导出Excel文件', padx=5, pady=5)
+        frame.pack(side=tk.TOP, padx=5, pady=5, fill=tk.BOTH, expand=tk.YES)
+
+        btn = tk.Button(frame, text='开始', command=self.dump_result)
         btn.pack(side=tk.TOP, padx=5, pady=5)
         #
         self.title(MainApp.TITLE)
@@ -207,6 +337,11 @@ class MainApp(tk.Tk):
         self._xlsx_sheets = []
 
     def on_button_create_new(self):
+        list_file = self._activity_list.get()
+        if len(list_file) == 0 or not os.path.exists(list_file):
+            messagebox.showerror(MainApp.TITLE, 'Please specify a valid activity-template-list file (JSON)!')
+            return
+
         if not os.path.exists(database_path):
             text_db = TextDataBase.create_new(database_path)
         elif messagebox.askyesno(MainApp.TITLE, 'Do you want to clear old data?'):
@@ -218,6 +353,7 @@ class MainApp(tk.Tk):
         self.read_all_strings_from_xlsx()
         #
         used_strings = set()
+        used_strings |= self.scan_activity_list()
         used_strings |= self.scan_solution()
         used_strings |= self.scan_prefab()
         used_strings |= self.scan_game_data()
@@ -263,7 +399,7 @@ class MainApp(tk.Tk):
             except Exception as e:
                 print(e)
 
-    def on_button_find_error(self):
+    def on_btn_find_error(self):
         if self._used_strings is None:
             messagebox.showerror(MainApp.TITLE, 'Must load data from database or collect data from scratch at first!')
             return
@@ -341,11 +477,40 @@ class MainApp(tk.Tk):
                 print(each)
             self._database.update_unused(unused)
         # 输出结果到Excel表里
-        self.dump_result(unused)
+        if messagebox.askyesno(MainApp.TITLE, 'Do you want to output Used and Unused strings (to excel)?'):
+            self.dump_result(unused)
         #
         messagebox.showinfo(MainApp.TITLE, '[Check Error] Job is done.')
 
-    def on_button_double_check(self):
+    def on_btn_find_activity_list(self):
+        options = {"title": "Open File: Activity Template List", "filetypes": [("JSON text", ("*.json")), ("Text file", ("*.txt"))]}
+        filename = filedialog.askopenfilename(**options)
+        if len(filename) == 0:
+            return
+        self._activity_list.set(filename)
+
+    def on_btn_browse_manual_file(self):
+        options = {"title": "打开文件：无用的多语言文本ID列表", "filetypes": [("Text file", ("*.txt"))]}
+        filename = filedialog.askopenfilename(**options)
+        if len(filename) == 0:
+            return
+        self._manual_analysis.set(filename)
+
+    def on_btn_update_unused_manually(self):
+        filename = self._manual_analysis.get()
+        if len(filename) == 0:
+            messagebox.showerror(MainApp.TITLE, '文件路径无效')
+            return
+        if self._database is None:
+            messagebox.showerror(MainApp.TITLE, '数据库无效')
+            return
+        id_list = try_read_text_file(filename)
+        id_list = id_list.split('\n')
+        id_list = [i.strip() for i in id_list]
+        id_list = [i for i in id_list if not self._database.is_used(i)]
+        self._database.append_unused(id_list)
+
+    def on_btn_double_check(self):
         """
         Too slow!
         :return:
@@ -366,7 +531,7 @@ class MainApp(tk.Tk):
                 if ext != '.cs':  # 只检查C#源码文件
                     continue
                 full_file_name = os.path.join(root, file)
-                content = MainApp.try_read_text(full_file_name)
+                content = try_read_text_file(full_file_name)
                 if content is None:
                     print('Unknown encoding: ' + full_file_name)
                     continue
@@ -374,33 +539,6 @@ class MainApp(tk.Tk):
                     if re.search(each, content):
                         print('%s: %s' % (each, file))
         messagebox.showinfo(MainApp.TITLE, '[Double Check] Job done!')
-
-    @staticmethod
-    def try_read_text(filename):
-        ifs = open(filename, 'rb')
-        raw = ifs.read()
-        ifs.close()
-
-        content = None
-        utf_boms = {
-            'utf-8-sig': [codecs.BOM_UTF8],
-            'utf-32': [codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE],
-            'utf-16': [codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE]
-        }
-        # 1. try BOM
-        for enc, boms in utf_boms.items():
-            if any(raw.startswith(bom) for bom in boms):
-                content = raw.decode(encoding=enc)
-                break
-        else:
-            # 2. without BOM
-            for enc in ['utf-8', 'utf-16', 'utf-32', 'gb2312', 'big5', 'big5hkscs', 'gbk', 'gb18030', 'ansi']:
-                try:
-                    content = raw.decode(encoding=enc)
-                    break
-                except UnicodeDecodeError as e:
-                    pass
-        return content
 
     def has_section_only(self, name):
         for section in self._xlsx_sheets:
@@ -434,13 +572,16 @@ class MainApp(tk.Tk):
 
     def scan_game_data(self):
         strings = set()
-        data_root = os.path.join(game_root, r'config\GameDatasNew')
-        regex = re.compile(r'(LC_\w+)')
-        folders = ['Client', 'Server', 'Share']
+        pattern = '|'.join([i + '_' for i in self._xlsx_sheets])
+        pattern = '((%s).+)' % pattern
+        regex = re.compile(pattern)
+        splitor = StringSplit('|;, ')  # 现暂时只发现了两种间隔符：;（分号）,（逗号）
+        data_root = os.path.join(game_root, r'config')
+        folders = ['GameDatasNew/Client', 'GameDatasNew/Server', 'GameDatasNew/Share', 'Campaign']
         for each_dir in folders:
             folder = os.path.join(data_root, each_dir)
-            wordbooks = [i for i in os.listdir(folder) if i.endswith('.xls')]
-            for each_book in wordbooks:
+            workbooks = [i for i in os.listdir(folder) if i.endswith('.xls')]
+            for each_book in workbooks:
                 # read all sheets at once [to a dictionary {sheet : data_frame}]
                 frame_dict = pd.read_excel(os.path.join(folder, each_book), sheet_name=None)
                 for sheet, frame in frame_dict.items():
@@ -449,16 +590,16 @@ class MainApp(tk.Tk):
                             cell = frame.values[each_row, each_col]
                             if not isinstance(cell, str):
                                 continue
-                            result = regex.search(cell)
-                            if result is not None:
-                                text_ids = result.group(1).strip()  # multiple IDs concatenated by "|".
-                                text_ids = text_ids.split('|')
-                                for tid in text_ids:
-                                    location = '%s - %s' % (each_dir, each_book)
-                                    if self.has_section_only(tid):
-                                        print('Error text ID: %s in <%s>' % (tid, location))
-                                    else:
-                                        strings.add((tid, location))
+                            for each_str in splitor.split(cell):  # cell可以容纳多条文本，以分号间隔开。
+                                result = regex.search(each_str)
+                                if result is None:
+                                    continue
+                                location = '%s - %s' % (each_dir, each_book)
+                                text_id = result.group(1)
+                                if self.has_section_only(text_id):
+                                    print('Error text ID: %s in <%s>' % (text_id, location))
+                                else:
+                                    strings.add((text_id, location))
         return strings
 
     def scan_solution(self):
@@ -479,7 +620,50 @@ class MainApp(tk.Tk):
             strings.add((tid, location))
         return strings
 
-    def dump_result(self, unused):
+    def scan_activity_list(self):
+        filename = self._activity_list.get()
+        if not os.path.exists(filename):
+            return set()
+        try:
+            template_file = try_read_text_file(filename)
+            templates = json.loads(template_file)
+            if templates["type"] != "rule_aty":
+                return set()
+            strings = set()
+            for activity in templates["data"]:
+                identity = activity["Id"]
+                # 1/5
+                title = activity["Title"]
+                if len(title) > 0:
+                    strings.add((title, 'activity: %s, title' % identity))
+                # 2/5
+                icon_title = activity["IconTitle"]
+                if len(icon_title) > 0:
+                    strings.add((icon_title, 'activity: %s, icon-title' % identity))
+                # 3/5
+                description_full = activity["Desc"]
+                if len(description_full) > 0:
+                    strings.add((description_full, 'activity: %s, description_full' % identity))
+                # 4/5
+                description_short = activity["ShortDesc"]
+                if len(description_short) > 0:
+                    strings.add((description_short, 'activity: %s, description_short' % identity))
+                # 5/5
+                rule = activity["Rule"]
+                if len(rule) > 0:
+                    strings.add((rule, 'activity: %s, rule' % identity))
+        except Exception as e:
+            print(e)
+        finally:
+            return strings
+
+    def dump_result(self, unused=None):
+        if self._database is None:
+            messagebox.showerror(MainApp.TITLE, 'Must load data from database or collect data from scratch at first!')
+            return
+        if unused is None:
+            unused = self._database.read_all_unused()
+        #
         # 为加快速度，把文本ID拆分成多个集合
         unused_dict = {}
         prefixes = [i + '_' for i in self._xlsx_sheets]
@@ -526,31 +710,17 @@ class MainApp(tk.Tk):
 
 
 def test():
-    target = r"TEXT: LC_COMMON_TransServer_StateName_{state + 1},Assets\Scripts\TransServer\UMenuServerDetails.cs"
-    regex = re.compile(r'TEXT:\s+(.+),(.+)')
-    result = regex.match(target)
-    if not result is None:
-        print(result.group(1) + '  ' + result.group(2))
-
-
-def test2():
-    a = set([1, 2, 3, 4, 5])
-    for i in a:
-        if i % 2 == 0:
-            a.remove(i)
-    for i in a:
-        print(i)
-
-
-def test3():
-    df = pd.DataFrame({'species': ['bear', 'bear', 'marsupial'],
-                       'population': [1864, 22000, 80000]},
-                      index=[2, 3, 4])
-    df.append()
-    writer = pd.ExcelWriter("tmp.xlsx")
-    df.to_excel(writer, sheet_name='Jia')
-    writer.save()
-    writer.close()
+    target = r"Tutorial_New_Fte_chat_{0}_5"
+    sections = ['Tutorial']
+    pattern = '|'.join([i + '_' for i in sections])
+    pattern = '((%s).+)' % pattern
+    regex = re.compile(pattern)
+    splitor = StringSplit('|;, ')
+    targets = splitor.split(target)
+    for each in targets:
+        result = regex.match(each)
+        if result is not None:
+            print(result.group(1))
 
 
 if __name__ == "__main__":
