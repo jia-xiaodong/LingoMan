@@ -1,0 +1,8 @@
+Activity_main
+Activity_rank
+Activity_FPS
+LC_COMMON_kvk_name_rule
+LC_COMMON_archive
+activity_hero_trial_floosday_rules
+11
+LC_COMMON_click

@@ -295,6 +295,19 @@ class MainApp(tk.Tk):
         btn = tk.Button(sub_frame, text='浏览', command=self.on_btn_find_activity_list)
         btn.pack(side=tk.LEFT, padx=5, pady=5, fill=tk.X, expand=tk.NO)
 
+        sub_frame = tk.Frame(frame1)
+        sub_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=tk.YES)
+
+        label = tk.Label(sub_frame, text='文本黑名单：')
+        label.pack(side=tk.LEFT, fill=tk.X, expand=tk.NO)
+
+        self._texts_blacklist = tk.StringVar()
+        entry = tk.Entry(sub_frame, textvariable=self._texts_blacklist)
+        entry.pack(side=tk.LEFT, padx=5, pady=5, fill=tk.X, expand=tk.YES)
+
+        btn = tk.Button(sub_frame, text='浏览', command=self.on_btn_find_blacklist)
+        btn.pack(side=tk.LEFT, padx=5, pady=5, fill=tk.X, expand=tk.NO)
+
         btn = tk.Button(frame1, text='开始扫描：活动模板、代码、Prefab、数据表', command=self.on_button_create_new)
         btn.pack(side=tk.TOP, padx=5, pady=5)
 
@@ -327,7 +340,10 @@ class MainApp(tk.Tk):
         frame.pack(side=tk.TOP, padx=5, pady=5, fill=tk.BOTH, expand=tk.YES)
 
         btn = tk.Button(frame, text='开始', command=self.dump_result)
-        btn.pack(side=tk.TOP, padx=5, pady=5)
+        btn.pack(side=tk.LEFT, padx=5, pady=5, expand=tk.YES)
+
+        btn = tk.Button(frame, text='开始（阿拉伯文）', command=self.dump_result_arabic)
+        btn.pack(side=tk.LEFT, padx=5, pady=5, expand=tk.YES)
         #
         self.title(MainApp.TITLE)
 
@@ -357,6 +373,19 @@ class MainApp(tk.Tk):
         used_strings |= self.scan_solution()
         used_strings |= self.scan_prefab()
         used_strings |= self.scan_game_data()
+        #
+        # 非文本ID的字符串，提前写到黑名单里
+        blacklist_path = self._texts_blacklist.get().strip()
+        if len(blacklist_path) > 0 and os.path.exists(blacklist_path):
+            with open(blacklist_path, 'r') as ifs:
+                all_lines = [i.strip() for i in ifs.readlines()]
+                blacklist = set(all_lines)
+            ignored_strings = set()
+            for tid, usage in used_strings:
+                if tid in blacklist:
+                    ignored_strings.add((tid, usage))
+            used_strings -= ignored_strings
+        #
         text_db.insert_batch(used_strings)
         self._database = text_db
         self._used_strings = MainApp.create_stats(used_strings)
@@ -506,7 +535,7 @@ class MainApp(tk.Tk):
             return
         id_list = try_read_text_file(filename)
         id_list = id_list.split('\n')
-        id_list = [i.strip() for i in id_list]
+        id_list = set(i.strip() for i in id_list)
         id_list = [i for i in id_list if not self._database.is_used(i)]
         self._database.append_unused(id_list)
 
@@ -573,7 +602,7 @@ class MainApp(tk.Tk):
     def scan_game_data(self):
         strings = set()
         pattern = '|'.join([i + '_' for i in self._xlsx_sheets])
-        pattern = '((%s).+)' % pattern
+        pattern = r'((%s)(\w+|{.+})*)' % pattern       #
         regex = re.compile(pattern)
         splitor = StringSplit('|;, ')  # 现暂时只发现了两种间隔符：;（分号）,（逗号）
         data_root = os.path.join(game_root, r'config')
@@ -591,7 +620,7 @@ class MainApp(tk.Tk):
                             if not isinstance(cell, str):
                                 continue
                             for each_str in splitor.split(cell):  # cell可以容纳多条文本，以分号间隔开。
-                                result = regex.search(each_str)
+                                result = regex.match(each_str)
                                 if result is None:
                                     continue
                                 location = '%s - %s' % (each_dir, each_book)
@@ -701,12 +730,74 @@ class MainApp(tk.Tk):
         writer_used.close()
         writer_unused.close()
 
+    def dump_result_arabic(self, unused=None):
+        if self._database is None:
+            messagebox.showerror(MainApp.TITLE, 'Must load data from database or collect data from scratch at first!')
+            return
+        if unused is None:
+            unused = self._database.read_all_unused()
+        #
+        # 为加快速度，把文本ID拆分成多个集合
+        unused_dict = {}
+        prefixes = [i + '_' for i in self._xlsx_sheets]
+        for i in self._xlsx_sheets:
+            unused_dict[i] = set()
+        for each_text in unused:
+            for prefix in prefixes:
+                if each_text.startswith(prefix):
+                    tid = each_text[len(prefix):]
+                    section = prefix[:-1]
+                    unused_dict[section].add(tid)
+                    break
+        # 最后结果输出到这两个文件里
+        writer_used = pd.ExcelWriter("used.xlsx")
+        writer_used2 = pd.ExcelWriter("used_untranslated.xlsx")     # 保存未翻译的阿拉伯文
+        writer_unused = pd.ExcelWriter("unused.xlsx")
+        #
+        arabic_pattern = re.compile(u'[\u0600-\u06ff]+')
+        # 遍历源Excel
+        workbook = os.path.join(game_root, r'Assets\Text\LOC.xlsx')
+        frame_dict = pd.read_excel(workbook, sheet_name=None)
+        for sheet, frame in frame_dict.items():
+            try:
+                frame_used = pd.DataFrame(columns=frame.columns)
+                frame_used2 = pd.DataFrame(columns=frame.columns)   # 保存未翻译的阿拉伯文
+                frame_unused = pd.DataFrame(columns=frame.columns)
+                for index, row in frame.iterrows():
+                    if row['ID'] in unused_dict[sheet]:
+                        frame_unused.loc[index] = row
+                    else:
+                        match = arabic_pattern.search(row['ar'])    # 搜索阿拉伯文
+                        if match is not None:
+                            frame_used.loc[index] = row
+                        else:
+                            frame_used2.loc[index] = row            # 没有阿拉伯文的（全是英文，或者是空白），放到另外一边
+                frame_used.to_excel(writer_used, sheet_name=sheet, index=False)
+                writer_used.save()
+                frame_used2.to_excel(writer_used2, sheet_name=sheet, index=False)
+                writer_used2.save()
+                frame_unused.to_excel(writer_unused, sheet_name=sheet, index=False)
+                writer_unused.save()
+            except Exception as e:
+                print(e)
+        # 保存到文件
+        writer_used.close()
+        writer_used2.close()
+        writer_unused.close()
+
     @staticmethod
     def create_stats(used_strings):
         stats = TextStats()
         for tid, location in used_strings:
             stats.add_entry(tid, location)
         return stats
+
+    def on_btn_find_blacklist(self):
+        options = {"title": "打开文件：", "filetypes": [("Text file", ("*.txt"))]}
+        filename = filedialog.askopenfilename(**options)
+        if len(filename) == 0:
+            return
+        self._texts_blacklist.set(filename)
 
 
 def test():
@@ -725,4 +816,3 @@ def test():
 
 if __name__ == "__main__":
     MainApp().mainloop()
-    #test()
